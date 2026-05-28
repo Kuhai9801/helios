@@ -349,8 +349,11 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
 
         // fetch required blocks
         let mut blocks_required = HashSet::new();
-        for receipt_proof in &receipt_proofs {
-            let block_hash = receipt_proof.1.receipt.block_hash().unwrap();
+        for (tx_hash, receipt_response) in &receipt_proofs {
+            let block_hash = receipt_response
+                .receipt
+                .block_hash()
+                .ok_or(ExecutionError::LogReceiptMetadataMismatch(*tx_hash))?;
             blocks_required.insert(block_hash);
         }
 
@@ -386,9 +389,15 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
             let receipt = &receipt_response.receipt;
             let proof = &receipt_response.receipt_proof;
 
-            let block_hash = receipt.block_hash().unwrap();
-            let block = blocks.get(&block_hash).unwrap();
-            let transaction_index = receipt.transaction_index().unwrap();
+            let block_hash = receipt
+                .block_hash()
+                .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
+            let block = blocks
+                .get(&block_hash)
+                .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
+            let transaction_index = receipt
+                .transaction_index()
+                .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
 
             verify_receipt_proof::<N>(receipt, block.receipts_root, proof)?;
 
@@ -400,13 +409,13 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
                 return Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into());
             };
 
+            verify_transaction_metadata::<N>(&tx_response.transaction, tx_hash, transaction_index)?;
+
             verify_transaction_proof::<N>(
                 &tx_response.transaction,
                 block.transactions_root,
                 &tx_response.transaction_proof,
             )?;
-
-            verify_transaction_metadata::<N>(&tx_response.transaction, tx_hash, transaction_index)?;
 
             let encoded_logs = N::receipt_logs(receipt)
                 .iter()
@@ -429,7 +438,9 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
 
         // Verify each log entry exists in the corresponding proved receipt logs
         for log in &logs {
-            let tx_hash = log.transaction_hash.unwrap();
+            let tx_hash = log
+                .transaction_hash
+                .ok_or(ExecutionError::LogReceiptMetadataMismatch(B256::ZERO))?;
             let log_encoded = rlp::encode(&log.inner);
             let receipt_logs = verified_receipts
                 .get(&tx_hash)
@@ -440,7 +451,10 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
             if !receipt_logs.encoded_logs.contains(&log_encoded) {
                 return Err(ExecutionError::MissingLog(
                     tx_hash,
-                    U256::from(log.log_index.unwrap()),
+                    U256::from(
+                        log.log_index
+                            .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?,
+                    ),
                 )
                 .into());
             }
@@ -528,6 +542,19 @@ mod tests {
             log.transaction_index.unwrap(),
         )
         .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("log metadata does not match proved receipt"));
+    }
+
+    #[test]
+    fn rejects_transaction_without_provenance_index() {
+        let mut tx = rpc_tx();
+        let tx_hash = tx.tx_hash();
+        tx.transaction_index = None;
+
+        let err = verify_transaction_metadata::<EthereumSpec>(&tx, tx_hash, 0).unwrap_err();
 
         assert!(err
             .to_string()
