@@ -294,13 +294,14 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Receipt
     }
 }
 
-struct VerifiedBlockMetadata {
+struct VerifiedBlockMetadata<N: NetworkSpec> {
     number: u64,
     receipts_root: B256,
     transactions_root: B256,
+    receipts: Vec<N::ReceiptResponse>,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct VerifiedLogMetadata {
     tx_hash: B256,
     block_hash: B256,
@@ -314,11 +315,54 @@ struct VerifiedLog {
     encoded: Vec<u8>,
 }
 
-struct VerifiedReceiptLogs {
-    logs: Vec<VerifiedLog>,
+fn build_verified_logs<N: NetworkSpec>(
+    receipts: &[N::ReceiptResponse],
+    transaction_index: u64,
+    tx_hash: B256,
+    block_hash: B256,
+    block_number: u64,
+) -> Result<Vec<VerifiedLog>> {
+    let mut next_log_index = 0_u64;
+    let transaction_index = usize::try_from(transaction_index)
+        .map_err(|_| ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
+
+    for (receipt_index, receipt) in receipts.iter().enumerate() {
+        let logs = N::receipt_logs(receipt);
+        if receipt_index == transaction_index {
+            return logs
+                .into_iter()
+                .enumerate()
+                .map(|(local_index, log)| {
+                    let local_index = u64::try_from(local_index)
+                        .map_err(|_| ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
+                    let log_index = next_log_index
+                        .checked_add(local_index)
+                        .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
+                    Ok(VerifiedLog {
+                        metadata: VerifiedLogMetadata {
+                            tx_hash,
+                            block_hash,
+                            block_number,
+                            transaction_index: transaction_index as u64,
+                            log_index,
+                        },
+                        encoded: rlp::encode(&log.inner),
+                    })
+                })
+                .collect();
+        }
+        next_log_index += u64::try_from(logs.len())
+            .map_err(|_| ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
+    }
+
+    Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into())
 }
 
 fn log_metadata(log: &Log, error_tx_hash: B256) -> Result<VerifiedLogMetadata> {
+    if log.removed {
+        return Err(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash).into());
+    }
+
     Ok(VerifiedLogMetadata {
         tx_hash: log
             .transaction_hash
@@ -382,12 +426,20 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
                 return Err(eyre!("block hash mismatch"));
             }
 
+            let receipts = self
+                .api
+                .get_block_receipts((*block_hash).into())
+                .await?
+                .ok_or(ExecutionError::NoReceiptsForBlock(header.number().into()))?;
+            verify_block_receipts::<N>(&receipts, &block)?;
+
             Ok::<_, eyre::Report>((
                 *block_hash,
-                VerifiedBlockMetadata {
+                VerifiedBlockMetadata::<N> {
                     number: header.number(),
                     receipts_root: header.receipts_root(),
                     transactions_root: header.transactions_root(),
+                    receipts,
                 },
             ))
         });
@@ -414,6 +466,14 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
                 .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
 
             verify_receipt_proof::<N>(receipt, block.receipts_root, proof)?;
+            let receipt_index = usize::try_from(transaction_index)
+                .map_err(|_| ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
+            let Some(verified_receipt) = block.receipts.get(receipt_index) else {
+                return Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into());
+            };
+            if N::encode_receipt(verified_receipt) != N::encode_receipt(receipt) {
+                return Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into());
+            }
 
             let Some(tx_response) = self
                 .api
@@ -431,23 +491,15 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
                 &tx_response.transaction_proof,
             )?;
 
-            let mut receipt_logs = Vec::new();
-            for log in N::receipt_logs(receipt) {
-                let metadata = log_metadata(&log, tx_hash)?;
-                if metadata.tx_hash != tx_hash
-                    || metadata.block_hash != block_hash
-                    || metadata.block_number != block.number
-                    || metadata.transaction_index != transaction_index
-                {
-                    return Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into());
-                }
-                receipt_logs.push(VerifiedLog {
-                    metadata,
-                    encoded: rlp::encode(&log.inner),
-                });
-            }
+            let receipt_logs = build_verified_logs::<N>(
+                &block.receipts,
+                transaction_index,
+                tx_hash,
+                block_hash,
+                block.number,
+            )?;
 
-            verified_receipts.insert(tx_hash, VerifiedReceiptLogs { logs: receipt_logs });
+            verified_receipts.insert(tx_hash, receipt_logs);
         }
 
         // Verify each log entry exists in the corresponding proved receipt logs
@@ -459,7 +511,7 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
                 .get(&tx_hash)
                 .ok_or(ExecutionError::NoReceiptForTransaction(tx_hash))?;
 
-            if !receipt_logs.logs.iter().any(|receipt_log| {
+            if !receipt_logs.iter().any(|receipt_log| {
                 receipt_log.metadata == metadata && receipt_log.encoded == log_encoded
             }) {
                 return Err(
@@ -506,7 +558,7 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Executi
 #[cfg(test)]
 mod tests {
     use helios_ethereum::spec::Ethereum as EthereumSpec;
-    use helios_test_utils::{rpc_tx, verifiable_api_logs_response};
+    use helios_test_utils::{rpc_block_receipts, rpc_tx, verifiable_api_logs_response};
 
     use super::*;
 
@@ -539,10 +591,43 @@ mod tests {
         let response = verifiable_api_logs_response();
         let log = response.logs[0].clone();
         let tx_hash = log.transaction_hash.unwrap();
-        let mut forged_metadata = log_metadata(&log, tx_hash).unwrap();
-        forged_metadata.log_index += 1;
+        let metadata = log_metadata(&log, tx_hash).unwrap();
+        let verified_logs = build_verified_logs::<EthereumSpec>(
+            &rpc_block_receipts(),
+            metadata.transaction_index,
+            tx_hash,
+            metadata.block_hash,
+            metadata.block_number,
+        )
+        .unwrap();
+        let log_encoded = rlp::encode(&log.inner);
 
-        assert!(log_metadata(&log, tx_hash).unwrap() != forged_metadata);
+        assert!(verified_logs
+            .iter()
+            .any(|verified_log| verified_log.metadata == metadata
+                && verified_log.encoded == log_encoded));
+
+        let mut forged_metadata = metadata.clone();
+        forged_metadata.log_index = u64::MAX;
+
+        assert!(!verified_logs
+            .iter()
+            .any(|verified_log| verified_log.metadata == forged_metadata
+                && verified_log.encoded == log_encoded));
+    }
+
+    #[test]
+    fn rejects_removed_log() {
+        let response = verifiable_api_logs_response();
+        let mut log = response.logs[0].clone();
+        let tx_hash = log.transaction_hash.unwrap();
+        log.removed = true;
+
+        let err = log_metadata(&log, tx_hash).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("log metadata does not match proved receipt"));
     }
 
     #[test]
