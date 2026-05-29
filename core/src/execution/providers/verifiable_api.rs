@@ -300,28 +300,42 @@ struct VerifiedBlockMetadata {
     transactions_root: B256,
 }
 
+#[derive(PartialEq, Eq)]
 struct VerifiedLogMetadata {
     tx_hash: B256,
     block_hash: B256,
     block_number: u64,
     transaction_index: u64,
+    log_index: u64,
+}
+
+struct VerifiedLog {
+    metadata: VerifiedLogMetadata,
+    encoded: Vec<u8>,
 }
 
 struct VerifiedReceiptLogs {
-    metadata: VerifiedLogMetadata,
-    encoded_logs: Vec<Vec<u8>>,
+    logs: Vec<VerifiedLog>,
 }
 
-fn verify_log_metadata(log: &Log, metadata: &VerifiedLogMetadata) -> Result<()> {
-    if log.transaction_hash != Some(metadata.tx_hash)
-        || log.block_hash != Some(metadata.block_hash)
-        || log.block_number != Some(metadata.block_number)
-        || log.transaction_index != Some(metadata.transaction_index)
-    {
-        return Err(ExecutionError::LogReceiptMetadataMismatch(metadata.tx_hash).into());
-    }
-
-    Ok(())
+fn log_metadata(log: &Log, error_tx_hash: B256) -> Result<VerifiedLogMetadata> {
+    Ok(VerifiedLogMetadata {
+        tx_hash: log
+            .transaction_hash
+            .ok_or(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash))?,
+        block_hash: log
+            .block_hash
+            .ok_or(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash))?,
+        block_number: log
+            .block_number
+            .ok_or(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash))?,
+        transaction_index: log
+            .transaction_index
+            .ok_or(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash))?,
+        log_index: log
+            .log_index
+            .ok_or(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash))?,
+    })
 }
 
 fn verify_transaction_metadata<N: NetworkSpec>(
@@ -417,46 +431,40 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
                 &tx_response.transaction_proof,
             )?;
 
-            let encoded_logs = N::receipt_logs(receipt)
-                .iter()
-                .map(|l| rlp::encode(&l.inner))
-                .collect::<Vec<_>>();
+            let mut receipt_logs = Vec::new();
+            for log in N::receipt_logs(receipt) {
+                let metadata = log_metadata(&log, tx_hash)?;
+                if metadata.tx_hash != tx_hash
+                    || metadata.block_hash != block_hash
+                    || metadata.block_number != block.number
+                    || metadata.transaction_index != transaction_index
+                {
+                    return Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into());
+                }
+                receipt_logs.push(VerifiedLog {
+                    metadata,
+                    encoded: rlp::encode(&log.inner),
+                });
+            }
 
-            verified_receipts.insert(
-                tx_hash,
-                VerifiedReceiptLogs {
-                    metadata: VerifiedLogMetadata {
-                        tx_hash,
-                        block_hash,
-                        block_number: block.number,
-                        transaction_index,
-                    },
-                    encoded_logs,
-                },
-            );
+            verified_receipts.insert(tx_hash, VerifiedReceiptLogs { logs: receipt_logs });
         }
 
         // Verify each log entry exists in the corresponding proved receipt logs
         for log in &logs {
-            let tx_hash = log
-                .transaction_hash
-                .ok_or(ExecutionError::LogReceiptMetadataMismatch(B256::ZERO))?;
+            let metadata = log_metadata(log, B256::ZERO)?;
+            let tx_hash = metadata.tx_hash;
             let log_encoded = rlp::encode(&log.inner);
             let receipt_logs = verified_receipts
                 .get(&tx_hash)
                 .ok_or(ExecutionError::NoReceiptForTransaction(tx_hash))?;
 
-            verify_log_metadata(log, &receipt_logs.metadata)?;
-
-            if !receipt_logs.encoded_logs.contains(&log_encoded) {
-                return Err(ExecutionError::MissingLog(
-                    tx_hash,
-                    U256::from(
-                        log.log_index
-                            .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?,
-                    ),
-                )
-                .into());
+            if !receipt_logs.logs.iter().any(|receipt_log| {
+                receipt_log.metadata == metadata && receipt_log.encoded == log_encoded
+            }) {
+                return Err(
+                    ExecutionError::MissingLog(tx_hash, U256::from(metadata.log_index)).into(),
+                );
             }
         }
 
@@ -512,20 +520,29 @@ mod tests {
 
         log.transaction_hash = Some(forged_tx_hash);
 
-        let err = verify_log_metadata(
-            &log,
-            &VerifiedLogMetadata {
-                tx_hash: original_tx_hash,
-                block_hash: log.block_hash.unwrap(),
-                block_number: log.block_number.unwrap(),
-                transaction_index: log.transaction_index.unwrap(),
-            },
-        )
-        .unwrap_err();
+        let mismatched_metadata = log_metadata(&log, original_tx_hash).unwrap();
 
-        assert!(err
-            .to_string()
-            .contains("log metadata does not match proved receipt"));
+        assert!(
+            mismatched_metadata
+                != VerifiedLogMetadata {
+                    tx_hash: original_tx_hash,
+                    block_hash: log.block_hash.unwrap(),
+                    block_number: log.block_number.unwrap(),
+                    transaction_index: log.transaction_index.unwrap(),
+                    log_index: log.log_index.unwrap(),
+                }
+        );
+    }
+
+    #[test]
+    fn rejects_log_with_unproved_log_index() {
+        let response = verifiable_api_logs_response();
+        let log = response.logs[0].clone();
+        let tx_hash = log.transaction_hash.unwrap();
+        let mut forged_metadata = log_metadata(&log, tx_hash).unwrap();
+        forged_metadata.log_index += 1;
+
+        assert!(log_metadata(&log, tx_hash).unwrap() != forged_metadata);
     }
 
     #[test]
