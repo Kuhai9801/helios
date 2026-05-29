@@ -299,6 +299,7 @@ struct VerifiedBlockMetadata<N: NetworkSpec> {
     receipts_root: B256,
     transactions_root: B256,
     receipts: Vec<N::ReceiptResponse>,
+    log_index_offsets: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,45 +318,57 @@ struct VerifiedLog {
 
 fn build_verified_logs<N: NetworkSpec>(
     receipts: &[N::ReceiptResponse],
+    log_index_offsets: &[u64],
     transaction_index: u64,
     tx_hash: B256,
     block_hash: B256,
     block_number: u64,
 ) -> Result<Vec<VerifiedLog>> {
-    let mut next_log_index = 0_u64;
     let transaction_index = usize::try_from(transaction_index)
         .map_err(|_| ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
+    let next_log_index = *log_index_offsets
+        .get(transaction_index)
+        .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
 
-    for (receipt_index, receipt) in receipts.iter().enumerate() {
-        let logs = N::receipt_logs(receipt);
-        if receipt_index == transaction_index {
-            return logs
-                .into_iter()
-                .enumerate()
-                .map(|(local_index, log)| {
-                    let local_index = u64::try_from(local_index)
-                        .map_err(|_| ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
-                    let log_index = next_log_index
-                        .checked_add(local_index)
-                        .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
-                    Ok(VerifiedLog {
-                        metadata: VerifiedLogMetadata {
-                            tx_hash,
-                            block_hash,
-                            block_number,
-                            transaction_index: transaction_index as u64,
-                            log_index,
-                        },
-                        encoded: rlp::encode(&log.inner),
-                    })
-                })
-                .collect();
-        }
-        next_log_index += u64::try_from(logs.len())
-            .map_err(|_| ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
-    }
+    let receipt = receipts
+        .get(transaction_index)
+        .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
 
-    Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into())
+    N::receipt_logs(receipt)
+        .into_iter()
+        .enumerate()
+        .map(|(local_index, log)| {
+            let local_index = u64::try_from(local_index)
+                .map_err(|_| ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
+            let log_index = next_log_index
+                .checked_add(local_index)
+                .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
+            Ok(VerifiedLog {
+                metadata: VerifiedLogMetadata {
+                    tx_hash,
+                    block_hash,
+                    block_number,
+                    transaction_index: transaction_index as u64,
+                    log_index,
+                },
+                encoded: rlp::encode(&log.inner),
+            })
+        })
+        .collect()
+}
+
+fn log_index_offsets<N: NetworkSpec>(receipts: &[N::ReceiptResponse]) -> Result<Vec<u64>> {
+    let mut next_log_index = 0_u64;
+    receipts
+        .iter()
+        .map(|receipt| {
+            let offset = next_log_index;
+            next_log_index = next_log_index
+                .checked_add(u64::try_from(N::receipt_logs(receipt).len())?)
+                .ok_or(eyre!("too many logs in block"))?;
+            Ok(offset)
+        })
+        .collect()
 }
 
 fn log_metadata(log: &Log, error_tx_hash: B256) -> Result<VerifiedLogMetadata> {
@@ -439,6 +452,7 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
                     number: header.number(),
                     receipts_root: header.receipts_root(),
                     transactions_root: header.transactions_root(),
+                    log_index_offsets: log_index_offsets::<N>(&receipts)?,
                     receipts,
                 },
             ))
@@ -493,6 +507,7 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
 
             let receipt_logs = build_verified_logs::<N>(
                 &block.receipts,
+                &block.log_index_offsets,
                 transaction_index,
                 tx_hash,
                 block_hash,
@@ -592,8 +607,11 @@ mod tests {
         let log = response.logs[0].clone();
         let tx_hash = log.transaction_hash.unwrap();
         let metadata = log_metadata(&log, tx_hash).unwrap();
+        let receipts = rpc_block_receipts();
+        let offsets = log_index_offsets::<EthereumSpec>(&receipts).unwrap();
         let verified_logs = build_verified_logs::<EthereumSpec>(
-            &rpc_block_receipts(),
+            &receipts,
+            &offsets,
             metadata.transaction_index,
             tx_hash,
             metadata.block_hash,
