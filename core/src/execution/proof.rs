@@ -107,9 +107,10 @@ fn is_empty_value(value: &[u8]) -> bool {
 
 /// Create a MPT proof for a given receipt in a list of receipts.
 pub fn create_receipt_proof<N: NetworkSpec>(
-    receipts: &[N::ReceiptResponse],
+    receipts: impl AsRef<[N::ReceiptResponse]>,
     target_index: usize,
 ) -> Vec<Bytes> {
+    let receipts = receipts.as_ref();
     // Initialise the trie builder with proof retainer for the target index
     let receipts_len = receipts.len();
     let retainer = ProofRetainer::new(vec![Nibbles::unpack(rlp::encode_fixed_size(&target_index))]);

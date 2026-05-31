@@ -595,23 +595,28 @@ mod tests {
         let response = verifiable_api_logs_response();
         let mut log = response.logs[0].clone();
         let original_tx_hash = log.transaction_hash.unwrap();
+        let receipts = rpc_block_receipts();
+        let offsets = log_index_offsets::<EthereumSpec>(&receipts).unwrap();
+        let verified_logs = build_verified_logs::<EthereumSpec>(
+            &receipts,
+            &offsets,
+            log.transaction_index.unwrap(),
+            original_tx_hash,
+            log.block_hash.unwrap(),
+            log.block_number.unwrap(),
+        )
+        .unwrap();
+        let verified_receipts = HashMap::from([(original_tx_hash, verified_logs)]);
+
+        verify_log_in_receipts(&log, &verified_receipts).unwrap();
+
         let forged_tx_hash = B256::with_last_byte(0x42);
         assert_ne!(forged_tx_hash, original_tx_hash);
 
         log.transaction_hash = Some(forged_tx_hash);
+        let err = verify_log_in_receipts(&log, &verified_receipts).unwrap_err();
 
-        let mismatched_metadata = log_metadata(&log, original_tx_hash).unwrap();
-
-        assert!(
-            mismatched_metadata
-                != VerifiedLogMetadata {
-                    tx_hash: original_tx_hash,
-                    block_hash: log.block_hash.unwrap(),
-                    block_number: log.block_number.unwrap(),
-                    transaction_index: log.transaction_index.unwrap(),
-                    log_index: log.log_index.unwrap(),
-                }
-        );
+        assert!(err.to_string().contains("could not prove receipt"));
     }
 
     #[test]
@@ -699,6 +704,24 @@ mod tests {
             &tx,
             tx.tx_hash(),
             log.transaction_index.unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("log metadata does not match proved receipt"));
+    }
+
+    #[test]
+    fn rejects_transaction_hash_mismatch_at_same_index() {
+        let tx = rpc_tx();
+        let forged_tx_hash = B256::with_last_byte(0x42);
+        assert_ne!(forged_tx_hash, tx.tx_hash());
+
+        let err = verify_transaction_metadata::<EthereumSpec>(
+            &tx,
+            forged_tx_hash,
+            tx.transaction_index().unwrap(),
         )
         .unwrap_err();
 
