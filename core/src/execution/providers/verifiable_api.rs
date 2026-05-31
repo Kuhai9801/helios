@@ -302,7 +302,7 @@ struct VerifiedBlockMetadata<N: NetworkSpec> {
     log_index_offsets: Vec<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct VerifiedLogMetadata {
     tx_hash: B256,
     block_hash: B256,
@@ -311,6 +311,7 @@ struct VerifiedLogMetadata {
     log_index: u64,
 }
 
+#[derive(PartialEq, Eq, Hash)]
 struct VerifiedLog {
     metadata: VerifiedLogMetadata,
     encoded: Vec<u8>,
@@ -323,7 +324,7 @@ fn build_verified_logs<N: NetworkSpec>(
     tx_hash: B256,
     block_hash: B256,
     block_number: u64,
-) -> Result<Vec<VerifiedLog>> {
+) -> Result<HashSet<VerifiedLog>> {
     let transaction_index = usize::try_from(transaction_index)
         .map_err(|_| ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
     let next_log_index = *log_index_offsets
@@ -402,6 +403,31 @@ fn verify_transaction_metadata<N: NetworkSpec>(
 ) -> Result<()> {
     if tx.tx_hash() != tx_hash || tx.transaction_index() != Some(transaction_index) {
         return Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into());
+    }
+
+    Ok(())
+}
+
+fn verify_log_in_receipts(
+    log: &Log,
+    verified_receipts: &HashMap<B256, HashSet<VerifiedLog>>,
+) -> Result<()> {
+    let metadata = log_metadata(log, B256::ZERO)?;
+    let tx_hash = metadata.tx_hash;
+    let verified_log = VerifiedLog {
+        metadata,
+        encoded: rlp::encode(&log.inner),
+    };
+    let receipt_logs = verified_receipts
+        .get(&tx_hash)
+        .ok_or(ExecutionError::NoReceiptForTransaction(tx_hash))?;
+
+    if !receipt_logs.contains(&verified_log) {
+        return Err(ExecutionError::MissingLog(
+            tx_hash,
+            U256::from(verified_log.metadata.log_index),
+        )
+        .into());
     }
 
     Ok(())
@@ -519,20 +545,7 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
 
         // Verify each log entry exists in the corresponding proved receipt logs
         for log in &logs {
-            let metadata = log_metadata(log, B256::ZERO)?;
-            let tx_hash = metadata.tx_hash;
-            let log_encoded = rlp::encode(&log.inner);
-            let receipt_logs = verified_receipts
-                .get(&tx_hash)
-                .ok_or(ExecutionError::NoReceiptForTransaction(tx_hash))?;
-
-            if !receipt_logs.iter().any(|receipt_log| {
-                receipt_log.metadata == metadata && receipt_log.encoded == log_encoded
-            }) {
-                return Err(
-                    ExecutionError::MissingLog(tx_hash, U256::from(metadata.log_index)).into(),
-                );
-            }
+            verify_log_in_receipts(log, &verified_receipts)?;
         }
 
         ensure_logs_match_filter(&logs, filter)?;
@@ -620,18 +633,44 @@ mod tests {
         .unwrap();
         let log_encoded = rlp::encode(&log.inner);
 
-        assert!(verified_logs
-            .iter()
-            .any(|verified_log| verified_log.metadata == metadata
-                && verified_log.encoded == log_encoded));
+        assert!(verified_logs.contains(&VerifiedLog {
+            metadata: metadata.clone(),
+            encoded: log_encoded.clone(),
+        }));
 
         let mut forged_metadata = metadata.clone();
         forged_metadata.log_index = u64::MAX;
 
-        assert!(!verified_logs
-            .iter()
-            .any(|verified_log| verified_log.metadata == forged_metadata
-                && verified_log.encoded == log_encoded));
+        assert!(!verified_logs.contains(&VerifiedLog {
+            metadata: forged_metadata,
+            encoded: log_encoded,
+        }));
+    }
+
+    #[test]
+    fn rejects_returned_log_not_in_verified_receipt_set() {
+        let response = verifiable_api_logs_response();
+        let mut log = response.logs[0].clone();
+        let original_tx_hash = log.transaction_hash.unwrap();
+        let receipts = rpc_block_receipts();
+        let offsets = log_index_offsets::<EthereumSpec>(&receipts).unwrap();
+        let verified_logs = build_verified_logs::<EthereumSpec>(
+            &receipts,
+            &offsets,
+            log.transaction_index.unwrap(),
+            original_tx_hash,
+            log.block_hash.unwrap(),
+            log.block_number.unwrap(),
+        )
+        .unwrap();
+        let verified_receipts = HashMap::from([(original_tx_hash, verified_logs)]);
+
+        verify_log_in_receipts(&log, &verified_receipts).unwrap();
+
+        log.log_index = Some(u64::MAX);
+        let err = verify_log_in_receipts(&log, &verified_receipts).unwrap_err();
+
+        assert!(err.to_string().contains("missing log for transaction"));
     }
 
     #[test]
