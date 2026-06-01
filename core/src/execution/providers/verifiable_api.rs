@@ -311,7 +311,7 @@ struct VerifiedLogMetadata {
     log_index: u64,
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct VerifiedLog {
     metadata: VerifiedLogMetadata,
     encoded: Vec<u8>,
@@ -411,7 +411,7 @@ fn verify_transaction_metadata<N: NetworkSpec>(
 fn verify_log_in_receipts(
     log: &Log,
     verified_receipts: &HashMap<B256, HashSet<VerifiedLog>>,
-) -> Result<()> {
+) -> Result<VerifiedLog> {
     let metadata = log_metadata(log, B256::ZERO)?;
     let tx_hash = metadata.tx_hash;
     let verified_log = VerifiedLog {
@@ -428,6 +428,40 @@ fn verify_log_in_receipts(
             U256::from(verified_log.metadata.log_index),
         )
         .into());
+    }
+
+    Ok(verified_log)
+}
+
+fn verify_returned_logs(
+    logs: &[Log],
+    verified_receipts: &HashMap<B256, HashSet<VerifiedLog>>,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut previous_position = None;
+
+    for log in logs {
+        let verified_log = verify_log_in_receipts(log, verified_receipts)?;
+        let position = (
+            verified_log.metadata.block_number,
+            verified_log.metadata.log_index,
+        );
+
+        if let Some(previous_position) = previous_position {
+            if position < previous_position {
+                return Err(ExecutionError::LogReceiptMetadataMismatch(
+                    verified_log.metadata.tx_hash,
+                )
+                .into());
+            }
+        }
+        previous_position = Some(position);
+
+        let tx_hash = verified_log.metadata.tx_hash;
+        let log_index = verified_log.metadata.log_index;
+        if !seen.insert(verified_log) {
+            return Err(ExecutionError::MissingLog(tx_hash, U256::from(log_index)).into());
+        }
     }
 
     Ok(())
@@ -543,10 +577,7 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
             verified_receipts.insert(tx_hash, receipt_logs);
         }
 
-        // Verify each log entry exists in the corresponding proved receipt logs
-        for log in &logs {
-            verify_log_in_receipts(log, &verified_receipts)?;
-        }
+        verify_returned_logs(&logs, &verified_receipts)?;
 
         ensure_logs_match_filter(&logs, filter)?;
         Ok(logs)
@@ -676,6 +707,58 @@ mod tests {
         let err = verify_log_in_receipts(&log, &verified_receipts).unwrap_err();
 
         assert!(err.to_string().contains("missing log for transaction"));
+    }
+
+    #[test]
+    fn rejects_duplicate_returned_logs() {
+        let response = verifiable_api_logs_response();
+        let log = response.logs[0].clone();
+        let tx_hash = log.transaction_hash.unwrap();
+        let receipts = rpc_block_receipts();
+        let offsets = log_index_offsets::<EthereumSpec>(&receipts).unwrap();
+        let verified_logs = build_verified_logs::<EthereumSpec>(
+            &receipts,
+            &offsets,
+            log.transaction_index.unwrap(),
+            tx_hash,
+            log.block_hash.unwrap(),
+            log.block_number.unwrap(),
+        )
+        .unwrap();
+        let verified_receipts = HashMap::from([(tx_hash, verified_logs)]);
+        let logs = vec![log.clone(), log];
+
+        let err = verify_returned_logs(&logs, &verified_receipts).unwrap_err();
+
+        assert!(err.to_string().contains("missing log for transaction"));
+    }
+
+    #[test]
+    fn rejects_out_of_order_returned_logs() {
+        let receipts = rpc_block_receipts();
+        let offsets = log_index_offsets::<EthereumSpec>(&receipts).unwrap();
+        let receipt_logs = EthereumSpec::receipt_logs(&receipts[0]);
+        let first = receipt_logs[0].clone();
+        let second = receipt_logs[1].clone();
+        let tx_hash = first.transaction_hash.unwrap();
+        let metadata = log_metadata(&first, tx_hash).unwrap();
+        let verified_logs = build_verified_logs::<EthereumSpec>(
+            &receipts,
+            &offsets,
+            metadata.transaction_index,
+            tx_hash,
+            metadata.block_hash,
+            metadata.block_number,
+        )
+        .unwrap();
+        let verified_receipts = HashMap::from([(tx_hash, verified_logs)]);
+
+        verify_returned_logs(&[first.clone(), second.clone()], &verified_receipts).unwrap();
+        let err = verify_returned_logs(&[second, first], &verified_receipts).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("log metadata does not match proved receipt"));
     }
 
     #[test]
