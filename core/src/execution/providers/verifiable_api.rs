@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 use alloy::{
     consensus::BlockHeader,
@@ -23,7 +23,10 @@ use helios_common::{
 };
 use helios_verifiable_api_client::{
     http::HttpVerifiableApi,
-    types::{AccountResponse, ExtendedAccessListResponse, LogsResponse, SendRawTxResponse},
+    types::{
+        AccountResponse, ExtendedAccessListResponse, LogsResponse, SendRawTxResponse,
+        TransactionReceiptResponse,
+    },
     VerifiableApi,
 };
 
@@ -294,174 +297,46 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Receipt
     }
 }
 
-struct VerifiedBlockMetadata<N: NetworkSpec> {
-    number: u64,
-    receipts_root: B256,
-    transactions_root: B256,
-    receipts: Vec<N::ReceiptResponse>,
-    log_index_offsets: Vec<u64>,
+fn log_tx_hash(log: &Log, error_tx_hash: B256) -> Result<B256> {
+    log.transaction_hash
+        .ok_or(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash).into())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct VerifiedLogMetadata {
-    tx_hash: B256,
-    block_hash: B256,
-    block_number: u64,
-    transaction_index: u64,
-    log_index: u64,
-}
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct VerifiedLog {
-    metadata: VerifiedLogMetadata,
-    encoded: Vec<u8>,
-}
-
-fn build_verified_logs<N: NetworkSpec>(
-    receipts: &[N::ReceiptResponse],
-    log_index_offsets: &[u64],
-    transaction_index: u64,
-    tx_hash: B256,
-    block_hash: B256,
-    block_number: u64,
-) -> Result<HashSet<VerifiedLog>> {
-    let transaction_index = usize::try_from(transaction_index)
-        .map_err(|_| ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
-    let next_log_index = *log_index_offsets
-        .get(transaction_index)
-        .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
-
-    let receipt = receipts
-        .get(transaction_index)
-        .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
-
-    N::receipt_logs(receipt)
-        .into_iter()
-        .enumerate()
-        .map(|(local_index, log)| {
-            let local_index = u64::try_from(local_index)
-                .map_err(|_| ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
-            let log_index = next_log_index
-                .checked_add(local_index)
-                .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
-            Ok(VerifiedLog {
-                metadata: VerifiedLogMetadata {
-                    tx_hash,
-                    block_hash,
-                    block_number,
-                    transaction_index: transaction_index as u64,
-                    log_index,
-                },
-                encoded: rlp::encode(&log.inner),
-            })
-        })
-        .collect()
-}
-
-fn log_index_offsets<N: NetworkSpec>(receipts: &[N::ReceiptResponse]) -> Result<Vec<u64>> {
-    let mut next_log_index = 0_u64;
-    receipts
-        .iter()
-        .map(|receipt| {
-            let offset = next_log_index;
-            next_log_index = next_log_index
-                .checked_add(u64::try_from(N::receipt_logs(receipt).len())?)
-                .ok_or(eyre!("too many logs in block"))?;
-            Ok(offset)
-        })
-        .collect()
-}
-
-fn log_metadata(log: &Log, error_tx_hash: B256) -> Result<VerifiedLogMetadata> {
-    if log.removed {
-        return Err(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash).into());
-    }
-
-    Ok(VerifiedLogMetadata {
-        tx_hash: log
-            .transaction_hash
-            .ok_or(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash))?,
-        block_hash: log
-            .block_hash
-            .ok_or(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash))?,
-        block_number: log
-            .block_number
-            .ok_or(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash))?,
-        transaction_index: log
-            .transaction_index
-            .ok_or(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash))?,
-        log_index: log
-            .log_index
-            .ok_or(ExecutionError::LogReceiptMetadataMismatch(error_tx_hash))?,
-    })
-}
-
-fn verify_transaction_metadata<N: NetworkSpec>(
-    tx: &N::TransactionResponse,
-    tx_hash: B256,
-    transaction_index: u64,
-) -> Result<()> {
-    if tx.tx_hash() != tx_hash || tx.transaction_index() != Some(transaction_index) {
-        return Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into());
-    }
-
-    Ok(())
-}
-
-fn verify_log_in_receipts(
-    log: &Log,
-    verified_receipts: &HashMap<B256, HashSet<VerifiedLog>>,
-) -> Result<VerifiedLog> {
-    let metadata = log_metadata(log, B256::ZERO)?;
-    let tx_hash = metadata.tx_hash;
-    let verified_log = VerifiedLog {
-        metadata,
-        encoded: rlp::encode(&log.inner),
-    };
-    let receipt_logs = verified_receipts
-        .get(&tx_hash)
-        .ok_or(ExecutionError::NoReceiptForTransaction(tx_hash))?;
-
-    if !receipt_logs.contains(&verified_log) {
-        return Err(ExecutionError::MissingLog(
-            tx_hash,
-            U256::from(verified_log.metadata.log_index),
-        )
-        .into());
-    }
-
-    Ok(verified_log)
-}
-
-fn verify_returned_logs(
+fn verify_receipt_proof_keys<T>(
     logs: &[Log],
-    verified_receipts: &HashMap<B256, HashSet<VerifiedLog>>,
-) -> Result<()> {
-    let mut seen = HashSet::new();
-    let mut previous_position = None;
-
+    receipt_proofs: &HashMap<B256, T>,
+) -> Result<HashSet<B256>> {
+    let mut required_tx_hashes = HashSet::new();
     for log in logs {
-        let verified_log = verify_log_in_receipts(log, verified_receipts)?;
-        let position = (
-            verified_log.metadata.block_number,
-            verified_log.metadata.log_index,
-        );
+        required_tx_hashes.insert(log_tx_hash(log, B256::ZERO)?);
+    }
 
-        if let Some(previous_position) = previous_position {
-            if position < previous_position {
-                return Err(ExecutionError::LogReceiptMetadataMismatch(
-                    verified_log.metadata.tx_hash,
-                )
-                .into());
-            }
+    for tx_hash in &required_tx_hashes {
+        if !receipt_proofs.contains_key(tx_hash) {
+            return Err(ExecutionError::NoReceiptForTransaction(*tx_hash).into());
         }
-        previous_position = Some(position);
+    }
 
-        let tx_hash = verified_log.metadata.tx_hash;
-        let log_index = verified_log.metadata.log_index;
-        if !seen.insert(verified_log) {
-            return Err(ExecutionError::MissingLog(tx_hash, U256::from(log_index)).into());
+    for tx_hash in receipt_proofs.keys() {
+        if !required_tx_hashes.contains(tx_hash) {
+            return Err(ExecutionError::LogReceiptMetadataMismatch(*tx_hash).into());
         }
+    }
+
+    Ok(required_tx_hashes)
+}
+
+fn verify_log_receipt_metadata<N: NetworkSpec>(
+    log: &Log,
+    receipt: &N::ReceiptResponse,
+    tx_hash: B256,
+) -> Result<()> {
+    if receipt.transaction_hash() != tx_hash
+        || log.transaction_hash != Some(tx_hash)
+        || log.block_hash != receipt.block_hash()
+        || log.transaction_index != receipt.transaction_index()
+    {
+        return Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into());
     }
 
     Ok(())
@@ -478,9 +353,48 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
             receipt_proofs,
         } = self.api.get_logs(filter).await?;
 
+        let required_tx_hashes = verify_receipt_proof_keys(&logs, &receipt_proofs)?;
+
+        // Map of tx_hash -> encoded receipt logs to avoid encoding multiple times
+        let mut txhash_encodedlogs_map: HashMap<B256, Vec<Vec<u8>>> = HashMap::new();
+
+        // Verify each log entry exists in the corresponding receipt logs
+        for log in &logs {
+            let tx_hash = log_tx_hash(log, B256::ZERO)?;
+            let log_encoded = rlp::encode(&log.inner);
+            let TransactionReceiptResponse {
+                receipt,
+                receipt_proof: _,
+            } = receipt_proofs
+                .get(&tx_hash)
+                .ok_or(ExecutionError::NoReceiptForTransaction(tx_hash))?;
+
+            verify_log_receipt_metadata::<N>(log, receipt, tx_hash)?;
+
+            if let Entry::Vacant(e) = txhash_encodedlogs_map.entry(tx_hash) {
+                let encoded_logs = N::receipt_logs(receipt)
+                    .iter()
+                    .map(|l| rlp::encode(&l.inner))
+                    .collect::<Vec<_>>();
+                e.insert(encoded_logs);
+            }
+            let receipt_logs_encoded = txhash_encodedlogs_map.get(&tx_hash).unwrap();
+
+            if !receipt_logs_encoded.contains(&log_encoded) {
+                return Err(ExecutionError::MissingLog(
+                    tx_hash,
+                    U256::from(log.log_index.unwrap()),
+                )
+                .into());
+            }
+        }
+
         // fetch required blocks
         let mut blocks_required = HashSet::new();
-        for (tx_hash, receipt_response) in &receipt_proofs {
+        for tx_hash in &required_tx_hashes {
+            let receipt_response = receipt_proofs
+                .get(tx_hash)
+                .ok_or(ExecutionError::NoReceiptForTransaction(*tx_hash))?;
             let block_hash = receipt_response
                 .receipt
                 .block_hash()
@@ -488,43 +402,24 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
             blocks_required.insert(block_hash);
         }
 
-        let blocks_fut = blocks_required.iter().map(async |block_hash| {
-            let block = self
+        let receipts_roots_fut = blocks_required.iter().map(async |block_hash| {
+            let root = self
                 .get_block((*block_hash).into(), false)
                 .await?
-                .ok_or(eyre!("block not found"))?;
-            let header = block.header();
+                .ok_or(eyre!("block not found"))?
+                .header()
+                .receipts_root();
 
-            if header.hash() != *block_hash {
-                return Err(eyre!("block hash mismatch"));
-            }
-
-            let receipts = self
-                .api
-                .get_block_receipts((*block_hash).into())
-                .await?
-                .ok_or(ExecutionError::NoReceiptsForBlock(header.number().into()))?;
-            verify_block_receipts::<N>(&receipts, &block)?;
-
-            Ok::<_, eyre::Report>((
-                *block_hash,
-                VerifiedBlockMetadata::<N> {
-                    number: header.number(),
-                    receipts_root: header.receipts_root(),
-                    transactions_root: header.transactions_root(),
-                    log_index_offsets: log_index_offsets::<N>(&receipts)?,
-                    receipts,
-                },
-            ))
+            Ok::<_, eyre::Report>((*block_hash, root))
         });
 
-        let blocks_vec = try_join_all(blocks_fut).await?;
-        let mut blocks = HashMap::new();
-        for (block_hash, block) in blocks_vec {
-            blocks.insert(block_hash, block);
+        let receipts_root_vec = try_join_all(receipts_roots_fut).await?;
+        let mut receipts_roots = HashMap::new();
+        for (block_hash, receipts_root) in receipts_root_vec {
+            receipts_roots.insert(block_hash, receipts_root);
         }
 
-        let mut verified_receipts = HashMap::new();
+        // Verify all receipts
         for (tx_hash, receipt_response) in receipt_proofs {
             let receipt = &receipt_response.receipt;
             let proof = &receipt_response.receipt_proof;
@@ -532,52 +427,12 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> LogProv
             let block_hash = receipt
                 .block_hash()
                 .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
-            let block = blocks
+            let receipts_root = receipts_roots
                 .get(&block_hash)
                 .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
-            let transaction_index = receipt
-                .transaction_index()
-                .ok_or(ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
 
-            verify_receipt_proof::<N>(receipt, block.receipts_root, proof)?;
-            let receipt_index = usize::try_from(transaction_index)
-                .map_err(|_| ExecutionError::LogReceiptMetadataMismatch(tx_hash))?;
-            let Some(verified_receipt) = block.receipts.get(receipt_index) else {
-                return Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into());
-            };
-            if N::encode_receipt(verified_receipt) != N::encode_receipt(receipt) {
-                return Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into());
-            }
-
-            let Some(tx_response) = self
-                .api
-                .get_transaction_by_location(block_hash.into(), transaction_index)
-                .await?
-            else {
-                return Err(ExecutionError::LogReceiptMetadataMismatch(tx_hash).into());
-            };
-
-            verify_transaction_metadata::<N>(&tx_response.transaction, tx_hash, transaction_index)?;
-
-            verify_transaction_proof::<N>(
-                &tx_response.transaction,
-                block.transactions_root,
-                &tx_response.transaction_proof,
-            )?;
-
-            let receipt_logs = build_verified_logs::<N>(
-                &block.receipts,
-                &block.log_index_offsets,
-                transaction_index,
-                tx_hash,
-                block_hash,
-                block.number,
-            )?;
-
-            verified_receipts.insert(tx_hash, receipt_logs);
+            verify_receipt_proof::<N>(receipt, *receipts_root, proof)?;
         }
-
-        verify_returned_logs(&logs, &verified_receipts)?;
 
         ensure_logs_match_filter(&logs, filter)?;
         Ok(logs)
@@ -617,209 +472,63 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Executi
 #[cfg(test)]
 mod tests {
     use helios_ethereum::spec::Ethereum as EthereumSpec;
-    use helios_test_utils::{rpc_block_receipts, rpc_tx, verifiable_api_logs_response};
+    use helios_test_utils::verifiable_api_logs_response;
 
     use super::*;
 
     #[test]
-    fn rejects_log_with_unproved_transaction_provenance() {
+    fn accepts_exact_receipt_proof_keys() {
         let response = verifiable_api_logs_response();
-        let mut log = response.logs[0].clone();
-        let original_tx_hash = log.transaction_hash.unwrap();
-        let receipts = rpc_block_receipts();
-        let offsets = log_index_offsets::<EthereumSpec>(&receipts).unwrap();
-        let verified_logs = build_verified_logs::<EthereumSpec>(
-            &receipts,
-            &offsets,
-            log.transaction_index.unwrap(),
-            original_tx_hash,
-            log.block_hash.unwrap(),
-            log.block_number.unwrap(),
-        )
-        .unwrap();
-        let verified_receipts = HashMap::from([(original_tx_hash, verified_logs)]);
 
-        verify_log_in_receipts(&log, &verified_receipts).unwrap();
+        verify_receipt_proof_keys(&response.logs, &response.receipt_proofs).unwrap();
+    }
 
-        let forged_tx_hash = B256::with_last_byte(0x42);
-        assert_ne!(forged_tx_hash, original_tx_hash);
+    #[test]
+    fn rejects_missing_receipt_proof_key() {
+        let mut response = verifiable_api_logs_response();
+        let tx_hash = response.logs[0].transaction_hash.unwrap();
+        response.receipt_proofs.remove(&tx_hash);
 
-        log.transaction_hash = Some(forged_tx_hash);
-        let err = verify_log_in_receipts(&log, &verified_receipts).unwrap_err();
+        let err = verify_receipt_proof_keys(&response.logs, &response.receipt_proofs).unwrap_err();
 
         assert!(err.to_string().contains("could not prove receipt"));
     }
 
     #[test]
-    fn rejects_log_with_unproved_log_index() {
-        let response = verifiable_api_logs_response();
-        let log = response.logs[0].clone();
-        let tx_hash = log.transaction_hash.unwrap();
-        let metadata = log_metadata(&log, tx_hash).unwrap();
-        let receipts = rpc_block_receipts();
-        let offsets = log_index_offsets::<EthereumSpec>(&receipts).unwrap();
-        let verified_logs = build_verified_logs::<EthereumSpec>(
-            &receipts,
-            &offsets,
-            metadata.transaction_index,
-            tx_hash,
-            metadata.block_hash,
-            metadata.block_number,
-        )
-        .unwrap();
-        let log_encoded = rlp::encode(&log.inner);
+    fn rejects_unexpected_receipt_proof_key() {
+        let mut response = verifiable_api_logs_response();
+        let tx_hash = response.logs[0].transaction_hash.unwrap();
+        let unexpected_tx_hash = B256::with_last_byte(0x42);
+        assert_ne!(unexpected_tx_hash, tx_hash);
+        let receipt_proof = response.receipt_proofs[&tx_hash].clone();
+        response
+            .receipt_proofs
+            .insert(unexpected_tx_hash, receipt_proof);
 
-        assert!(verified_logs.contains(&VerifiedLog {
-            metadata: metadata.clone(),
-            encoded: log_encoded.clone(),
-        }));
+        let err = verify_receipt_proof_keys(&response.logs, &response.receipt_proofs).unwrap_err();
 
-        let mut forged_metadata = metadata.clone();
-        forged_metadata.log_index = u64::MAX;
-
-        assert!(!verified_logs.contains(&VerifiedLog {
-            metadata: forged_metadata,
-            encoded: log_encoded,
-        }));
+        assert!(err
+            .to_string()
+            .contains("log metadata does not match proved receipt"));
     }
 
     #[test]
-    fn rejects_returned_log_not_in_verified_receipt_set() {
-        let response = verifiable_api_logs_response();
+    fn rejects_log_with_rekeyed_receipt_proof() {
+        let mut response = verifiable_api_logs_response();
         let mut log = response.logs[0].clone();
         let original_tx_hash = log.transaction_hash.unwrap();
-        let receipts = rpc_block_receipts();
-        let offsets = log_index_offsets::<EthereumSpec>(&receipts).unwrap();
-        let verified_logs = build_verified_logs::<EthereumSpec>(
-            &receipts,
-            &offsets,
-            log.transaction_index.unwrap(),
-            original_tx_hash,
-            log.block_hash.unwrap(),
-            log.block_number.unwrap(),
-        )
-        .unwrap();
-        let verified_receipts = HashMap::from([(original_tx_hash, verified_logs)]);
-
-        verify_log_in_receipts(&log, &verified_receipts).unwrap();
-
-        log.log_index = Some(u64::MAX);
-        let err = verify_log_in_receipts(&log, &verified_receipts).unwrap_err();
-
-        assert!(err.to_string().contains("missing log for transaction"));
-    }
-
-    #[test]
-    fn rejects_duplicate_returned_logs() {
-        let response = verifiable_api_logs_response();
-        let log = response.logs[0].clone();
-        let tx_hash = log.transaction_hash.unwrap();
-        let receipts = rpc_block_receipts();
-        let offsets = log_index_offsets::<EthereumSpec>(&receipts).unwrap();
-        let verified_logs = build_verified_logs::<EthereumSpec>(
-            &receipts,
-            &offsets,
-            log.transaction_index.unwrap(),
-            tx_hash,
-            log.block_hash.unwrap(),
-            log.block_number.unwrap(),
-        )
-        .unwrap();
-        let verified_receipts = HashMap::from([(tx_hash, verified_logs)]);
-        let logs = vec![log.clone(), log];
-
-        let err = verify_returned_logs(&logs, &verified_receipts).unwrap_err();
-
-        assert!(err.to_string().contains("missing log for transaction"));
-    }
-
-    #[test]
-    fn rejects_out_of_order_returned_logs() {
-        let receipts = rpc_block_receipts();
-        let offsets = log_index_offsets::<EthereumSpec>(&receipts).unwrap();
-        let receipt_logs = EthereumSpec::receipt_logs(&receipts[0]);
-        let first = receipt_logs[0].clone();
-        let second = receipt_logs[1].clone();
-        let tx_hash = first.transaction_hash.unwrap();
-        let metadata = log_metadata(&first, tx_hash).unwrap();
-        let verified_logs = build_verified_logs::<EthereumSpec>(
-            &receipts,
-            &offsets,
-            metadata.transaction_index,
-            tx_hash,
-            metadata.block_hash,
-            metadata.block_number,
-        )
-        .unwrap();
-        let verified_receipts = HashMap::from([(tx_hash, verified_logs)]);
-
-        verify_returned_logs(&[first.clone(), second.clone()], &verified_receipts).unwrap();
-        let err = verify_returned_logs(&[second, first], &verified_receipts).unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("log metadata does not match proved receipt"));
-    }
-
-    #[test]
-    fn rejects_removed_log() {
-        let response = verifiable_api_logs_response();
-        let mut log = response.logs[0].clone();
-        let tx_hash = log.transaction_hash.unwrap();
-        log.removed = true;
-
-        let err = log_metadata(&log, tx_hash).unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("log metadata does not match proved receipt"));
-    }
-
-    #[test]
-    fn rejects_transaction_proof_at_different_receipt_index() {
-        let response = verifiable_api_logs_response();
-        let log = response.logs[0].clone();
-        let tx = rpc_tx();
-
-        assert_ne!(tx.transaction_index(), log.transaction_index);
-
-        let err = verify_transaction_metadata::<EthereumSpec>(
-            &tx,
-            tx.tx_hash(),
-            log.transaction_index.unwrap(),
-        )
-        .unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("log metadata does not match proved receipt"));
-    }
-
-    #[test]
-    fn rejects_transaction_hash_mismatch_at_same_index() {
-        let tx = rpc_tx();
         let forged_tx_hash = B256::with_last_byte(0x42);
-        assert_ne!(forged_tx_hash, tx.tx_hash());
+        assert_ne!(forged_tx_hash, original_tx_hash);
 
-        let err = verify_transaction_metadata::<EthereumSpec>(
-            &tx,
-            forged_tx_hash,
-            tx.transaction_index().unwrap(),
-        )
-        .unwrap_err();
+        let receipt_response = response.receipt_proofs.remove(&original_tx_hash).unwrap();
+        response
+            .receipt_proofs
+            .insert(forged_tx_hash, receipt_response);
+        log.transaction_hash = Some(forged_tx_hash);
 
-        assert!(err
-            .to_string()
-            .contains("log metadata does not match proved receipt"));
-    }
-
-    #[test]
-    fn rejects_transaction_without_provenance_index() {
-        let mut tx = rpc_tx();
-        let tx_hash = tx.tx_hash();
-        tx.transaction_index = None;
-
-        let err = verify_transaction_metadata::<EthereumSpec>(&tx, tx_hash, 0).unwrap_err();
+        let receipt = &response.receipt_proofs[&forged_tx_hash].receipt;
+        let err =
+            verify_log_receipt_metadata::<EthereumSpec>(&log, receipt, forged_tx_hash).unwrap_err();
 
         assert!(err
             .to_string()

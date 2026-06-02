@@ -107,10 +107,9 @@ fn is_empty_value(value: &[u8]) -> bool {
 
 /// Create a MPT proof for a given receipt in a list of receipts.
 pub fn create_receipt_proof<N: NetworkSpec>(
-    receipts: impl AsRef<[N::ReceiptResponse]>,
+    receipts: Vec<N::ReceiptResponse>,
     target_index: usize,
 ) -> Vec<Bytes> {
-    let receipts = receipts.as_ref();
     // Initialise the trie builder with proof retainer for the target index
     let receipts_len = receipts.len();
     let retainer = ProofRetainer::new(vec![Nibbles::unpack(rlp::encode_fixed_size(&target_index))]);
@@ -296,7 +295,7 @@ mod tests {
         let expected = verifiable_api_tx_receipt_response();
 
         let proof = create_receipt_proof::<EthereumSpec>(
-            &receipts,
+            receipts,
             expected.receipt.transaction_index().unwrap() as usize,
         );
 
@@ -309,7 +308,7 @@ mod tests {
         let receipts_root = rpc_block().header().receipts_root();
 
         for idx in 0..receipts.len() {
-            let proof = create_receipt_proof::<EthereumSpec>(&receipts, idx);
+            let proof = create_receipt_proof::<EthereumSpec>(receipts.clone(), idx);
 
             let result =
                 verify_receipt_proof::<EthereumSpec>(&receipts[idx], receipts_root, &proof);

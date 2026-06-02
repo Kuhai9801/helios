@@ -127,7 +127,7 @@ impl<N: NetworkSpec> VerifiableApi<N> for ApiService<N> {
             .ok_or(ExecutionError::NoReceiptsForBlock(block_num.into()))?;
 
         let receipt_proof =
-            create_receipt_proof::<N>(&receipts, receipt.transaction_index().unwrap() as usize);
+            create_receipt_proof::<N>(receipts, receipt.transaction_index().unwrap() as usize);
 
         Ok(Some(TransactionReceiptResponse {
             receipt,
@@ -332,7 +332,7 @@ impl<N: NetworkSpec> ApiService<N> {
                     let receipt = receipts.get(*tx_index as usize).unwrap();
 
                     let proof = create_receipt_proof::<N>(
-                        receipts,
+                        receipts.to_vec(),
                         receipt.transaction_index().unwrap() as usize,
                     );
 
